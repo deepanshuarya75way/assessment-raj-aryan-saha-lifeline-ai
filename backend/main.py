@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from typing import List
-from fastapi import FastAPI
+import heapq
+from fastapi import FastAPI ,HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,138 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+LOCATIONS ={
+    "City Center": (30.3165, 78.0322),
+    "Clock Tower": (30.3256, 78.0437),
+    "Rajpur Road": (30.3600, 78.0700),
+    "ISBT Junction": (30.3165, 78.0330),
+    "Market Road": (30.3200, 78.0400),
+    "Ring Road":(30.3300,78.0600),
+    "Medical District": (30.3500, 78.0800),
+
+}
+
+ROADS =[
+    ("City Center","Clock Tower",1.8,30),
+    ("City Center","ISBT Junction",2.5,35),
+    ("Clock Tower","Market Road",1.5,30),
+    ("Market Road","Rajpur Road",3.0,35),
+    ("Rajpur Road","Medical District",4.0,45),
+    ("Ring Road","Rajpur Road",2.5,40),
+    ("Ring Road","Medical District",6.6,50),
+    ("ISBT Junction","Ring Road",4.0,40),
+
+
+
+]
+
+GRAPH = {
+    location:[] 
+    for location in LOCATIONS
+}
+
+for start, end, distance, speed in ROADS:
+    travel_time =(distance/speed)*60
+
+    GRAPH[start].append({
+        "to":end,
+        "distance":distance,
+        "time":travel_time
+    }) 
+    GRAPH[end].append({
+        "to":start,
+        "distance":distance,
+        "time": travel_time
+    })
+    print("GRAPH TEST:", GRAPH)
+
+def shortest_path(origin: str,destination: str):
+
+    if origin not in GRAPH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid origin location: {origin}"
+        )
+
+    if destination not in GRAPH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid destination location: {origin}"
+
+        )    
+    distances ={
+        location: float("inf")
+        for location in GRAPH
+    }        
+
+    previous ={
+        location:None
+        for location in GRAPH
+    }
+    distances[origin] = 0
+
+    priority_queue =[(0, origin)]
+
+    while priority_queue:
+
+        current_distance,current = heapq.heappop(priority_queue)
+
+        if current_distance > distances[current]:
+            continue
+        if current == destination:
+            break
+
+        for edge in GRAPH[current]:
+
+            new_distance =(
+                current_distance + edge["distance"]
+                )
+
+            if new_distance <distances[edge["to"]]:
+
+                 distances[edge["to"]] = new_distance
+                 previous[edge["to"]]  = current
+
+                 heapq.heappush(
+                    priority_queue,
+                    (new_distance,
+                    edge["to"])
+                 )   
+        if distances[destination] ==float("inf"):
+            raise HTTPException(
+            status_code=404,
+            detail=f"No route available from{origin} to{destination}"
+        )    
+
+
+        path =[]
+        current = destination
+
+        while current is not None:
+            path.append(current)
+            current = previous[current]
+
+        path.reverse()
+
+        total_distance = distances[destination]
+
+        total_time =0
+        for i in range(len(path)- 1):
+
+            current_node = path[i]
+            next_node =path[i+1]
+
+            for edge in GRAPH[current_node]:
+
+                if edge["to"] == next_node:
+                    total_time+= edge["time"]
+                    break
+        return{
+            "route": path,
+            "total_distance_km":round(total_distance, 2),
+            "estimated_travel_time_min":round(total_time,1)
+        }                           
 
 ROUTES = [
     {
@@ -85,6 +218,10 @@ INCIDENTS = [
 class AnalysisRequest(BaseModel):
     emergency_type: str = Field(default="Cardiac emergency")
     severity: int = Field(default=5, ge=1, le=5)
+
+class RouteRequest(BaseModel):
+    origin:str
+    destination: str    
 
 
 def score_route(route: dict, severity: int, emergency_type: str) -> tuple[float, list[str]]:
@@ -171,6 +308,21 @@ def get_routes():
 @app.get("/api/incidents")
 def get_incidents():
     return INCIDENTS
+
+@app.post("/api/shortest-route")
+def calculate_shortest_route(request:RouteRequest):
+
+    result = shortest_path(
+        request.origin,
+        request.destination
+    )
+
+    return {
+        "success": True,
+        "origin": request.origin,
+        "destination": request.destination,
+        **result
+    }
 
 
 @app.post("/api/analyze")
