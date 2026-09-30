@@ -1,6 +1,7 @@
+import sqlite3
 from datetime import datetime, timezone
 from typing import List
-from fastapi import FastAPI
+from fastapi import FastAPI,HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -86,6 +87,41 @@ class AnalysisRequest(BaseModel):
     emergency_type: str = Field(default="Cardiac emergency")
     severity: int = Field(default=5, ge=1, le=5)
 
+class RouteFeedback(BaseModel):
+    quality:str = Field(default="poor")
+
+FEEDBACK_DB ="route_feedback.db"
+POOR_FEEDBACK_PENALTY = 20
+POOR_FEEDBACK_THRESHOLD = 3
+
+def init_feedback_db():
+    conn = sqlite3.connect(FEEDBACK_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            route_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_feedback_db()
+
+def get_route_feedback(route_id:str):
+    conn = sqlite3.connect(FEEDBACK_DB)
+    count = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM route_feedback
+        WHERE route_id = ? AND quality ='poor'
+        """,
+        (route_id,)
+    ).fetchone()[0]
+    conn.close()
+    return count
+
+
 
 def score_route(route: dict, severity: int, emergency_type: str) -> tuple[float, list[str]]:
     # Lower score is better.
@@ -128,12 +164,19 @@ def score_route(route: dict, severity: int, emergency_type: str) -> tuple[float,
 
     severity_factor = 1 + (severity - 1) * 0.18
 
+    poor_feedback_count = get_route_feedback(route["id"])
+
+    quality_penalty =(
+        poor_feedback_count * POOR_FEEDBACK_PENALTY
+    )
+
     score = (
         route["eta_min"] * weights["eta"]
         + route["traffic"] * weights["traffic"]
         + route["risk"] * weights["risk"] * severity_factor
         + route["intervention"] * weights["intervention"]
         + max(route["delay"], 0) * weights["delay"]
+        + quality_penalty
     )
 
     reasons = []
@@ -153,6 +196,17 @@ def score_route(route: dict, severity: int, emergency_type: str) -> tuple[float,
     if route["delay"] > 0:
         reasons.append(
             f"Expected {route['delay']} min delay"
+        )
+
+    if poor_feedback_count > 0:
+        reasons.append(
+            f"{poor_feedback_count} poor-quality feedback report(s),"
+            f"+{quality_penalty} routing penalty"
+        )    
+
+    if poor_feedback_count >= POOR_FEEDBACK_THRESHOLD:
+        reasons.append(
+            "Excluded from routing due to repeated poor-quality feedback"
         )
 
     return round(score, 2), reasons
@@ -178,15 +232,55 @@ def analyze(request: AnalysisRequest):
     analyzed = []
 
     for route in ROUTES:
-        score, reasons = score_route(route, request.severity, request.emergency_type)
+
+        poor_feedback_count = get_route_feedback(route["id"])
+
+        score, reasons = score_route(
+            route,
+            request.severity,
+            request.emergency_type
+        )
+
+        excluded = (
+            poor_feedback_count >= POOR_FEEDBACK_THRESHOLD
+        )
         analyzed.append({
             **route,
             "score": score,
-            "reasons": reasons,
+            "reasons":reasons,
+
+            "poor_feedback_count": poor_feedback_count,
+            "quality_penalty": (
+                poor_feedback_count * POOR_FEEDBACK_PENALTY
+            ),
+            "excluded": excluded,
         })
 
-    analyzed.sort(key=lambda item: item["score"])
-    recommended = analyzed[0]
+
+    available_routes = [
+        route
+        for route in analyzed
+        if not route["excluded"]
+    ]
+
+    if not available_routes:
+        raise HTTPException(
+            status_code=400,
+            details=(
+                "All available routes have been excluded"
+                "due to repeated poor-quality feedback."
+            )
+        )
+
+    available_routes.sort(
+        key=lambda item: item["score"]
+    )   
+
+    recommended = available_routes[0]
+
+    analyzed.sort(
+        key=lambda item: item["score"]
+    )
 
     explanation = (
         f"{recommended['name']} is recommended because it has an estimated "
@@ -202,4 +296,63 @@ def analyze(request: AnalysisRequest):
         "recommended_route": recommended,
         "routes": analyzed,
         "explanation": explanation,
+    }
+
+
+@app.post("/api/routes/{route_id}/feedback")
+def submit_route_feedback(
+    route_id:str,
+    feedback: RouteFeedback
+):
+    route = next(
+        (r for r in ROUTES if r["id"] == route_id),
+        None
+    )
+    if route is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Route not found"
+        )
+
+
+    if feedback.quality !="poor":
+        raise HTTPException(
+            status_code=404,
+            detail="only poor quality feedback is currently supported "
+        )    
+
+    conn = sqlite3.connect(FEEDBACK_DB)
+
+    conn.execute(
+        """
+        INSERT INTO route_feedback
+        (route_id, quality, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (
+            route_id,
+            feedback.quality,
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
+    conn.commit()
+    conn.close()
+
+    count = get_route_feedback(route_id)
+
+    return {
+        "message": "Route feedback recorded",
+        "route_id": route_id,
+        "quality":feedback.quality,
+
+        "poor_feedback_count": count,
+        "quality_penalty": (
+            count * POOR_FEEDBACK_PENALTY
+        ),
+
+        "excluded": (
+            count >= POOR_FEEDBACK_THRESHOLD
+        ),
+
+        "eta_min": route["eta_min"]
     }

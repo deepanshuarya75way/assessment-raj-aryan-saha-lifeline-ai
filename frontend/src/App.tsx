@@ -26,6 +26,10 @@ type RouteData = {
   delay: number;
   score?: number;
   reasons?: string[];
+
+  poor_feedback_count?: number;
+  quality_penalty?: number;
+  excluded?: boolean;
 };
 
 type Analysis = {
@@ -62,6 +66,35 @@ function App() {
       alert("Backend is not running. Start FastAPI on port 8000.");
     } finally {
       setLoading(false);
+    }
+  }
+  async function submitPoorFeedback(routeID: string) {
+    try{
+      const response = await fetch(
+        '${API}/api/routes/${routeID}/feedback',
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body:JSON.stringify({
+            quality: "poor"
+          })
+        }
+      );
+    if (!response.ok) {
+      throw new Error("Feedback failed");
+    }  
+    const result = await response.json();
+
+    alert(
+      result.excluded
+        ? '${routeID} has been excluded from future routing.'
+        : 'poor-quality feedback recorded for ${routeID}.'
+    );
+    await analyze();
+    } catch (error) {
+      alert("Could not submit route feedback.");
     }
   }
 
@@ -193,6 +226,12 @@ function App() {
                 <div className="explanation">
                   <strong>Why this route?</strong>
                   <p>{analysis?.explanation}</p>
+                  <button
+                    className="secondary"
+                    onClick={() => submitPoorFeedback(recommended.id)}
+                    >
+                      Mark Route as Poor Quality
+                    </button>
                 </div>
               </>
             ) : (
@@ -252,6 +291,19 @@ function App() {
                   </div>
                 ))}
                 {!analysis && <div className="empty-inline">Run an analysis from Command Center to populate live route scores.</div>}
+                {!route.excluded && (
+                  <button
+                  className="secondary compact"
+                  onClick={() => submitPoorFeedback(Route.id)}
+                  >
+                    Poor Quality
+                    </button>
+                )}
+                {route.excluded && (
+                  <span className="excluded">
+                    Excluded
+                  </span>
+                )}
               </div>
               <button className="primary compact" onClick={() => setPage("Command Center")}>← Back to command center</button>
             </div>
